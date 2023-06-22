@@ -1,0 +1,333 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Transform:
+  - AWS::LanguageExtensions # use Fn::ToJsonString
+  - AWS::Serverless-2016-10-31
+
+Parameters:
+  TargetEnvironment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+  accessLogsDatabase:
+    Type: String
+    Description: name of the glue database - must not contain caps
+    Default: access-database
+  accessLogsTable:
+    Type: String
+    Description: name of the glue table that contains s3 bucket access logs - must not contain caps
+    Default: cdn-bucket-logs
+  hostedZoneId:
+    Type: String
+    Description: Id of the doamin hosted zone. - leave blank to omit
+    Default: ''
+  domainName:
+    Type: String
+    Description: name of domain registered in route 53. - leave blank to omit
+    Default: ''
+  subDomainName:
+    Type: String
+    Description: name of sub domain. - leave blank to omit
+    Default: media
+  domainCertUSEast1:
+    Type: String
+    Description: cert arn of the configured domain - cert must be in us-east-1 - leave blank to omit
+    Default: ''
+  
+Conditions:
+  IsDomainConfigured:
+    !And
+      - !Not [!Equals [!Ref hostedZoneId, '']]
+      - !Not [!Equals [!Ref domainName, '']]
+      - !Not [!Equals [!Ref subDomainName, '']]
+      - !Not [!Equals [!Ref domainCertUSEast1, '']]
+  
+Resources:
+  CDNbucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-bucket"
+      LoggingConfiguration: # where to send object access logs - theres a delay
+        DestinationBucketName: !Ref CDNbucketAccessLogs
+        LogFilePrefix: !Sub "${accessLogsTable}/"
+      VersioningConfiguration:
+        Status: Enabled
+      CorsConfiguration:
+        CorsRules:
+          - Id: myCORSRuleId1
+            AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+            AllowedOrigins:
+              - '*'
+    DeletionPolicy: Delete
+    DependsOn:
+      - CDNbucketAccessLogs
+  
+  CDNbucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties: 
+      Bucket: !Ref CDNbucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Join ['', ['arn:aws:s3:::', !Ref CDNbucket, '/*']]
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Join ['', ['arn:aws:cloudfront::', !Ref AWS::AccountId, ':distribution/', !Ref CDNbucketDistribution]]
+    DependsOn:
+      - CDNbucket
+      - CDNbucketAccessLogs
+  
+  CDNbucketAccessLogs:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-bucket-access-logs"
+      VersioningConfiguration:
+        Status: Enabled
+      #LifecycleConfiguration:
+      #  Rules:
+      #    - Id: rule0
+      #      Status: Enabled
+      #      ExpirationInDays: 1
+      #      NoncurrentVersionExpiration:
+      #        NoncurrentDays: 1
+    DeletionPolicy: Delete
+  
+  CDNbucketAccessLogsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties: 
+      Bucket: !Ref CDNbucketAccessLogs
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action:
+              - s3:PutObject
+            Resource:
+              - !Join ['', ['arn:aws:s3:::', !Ref CDNbucketAccessLogs]]
+              - !Join ['', ['arn:aws:s3:::', !Ref CDNbucketAccessLogs, '/*']]
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Join ['', ['arn:aws:s3:::', !Ref CDNbucket]]
+    DependsOn:
+      - CDNbucketAccessLogs
+  
+  CDNbucketDistributionOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties: 
+      OriginAccessControlConfig: 
+        Name: !Sub "${AWS::StackName}-CDNbucketDistributionOAC"
+        Description: !Join ['', [!Ref AWS::StackName, '-CDNbucketDistributionOAC', 'description']]
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  
+  # < HTTP/1.1 200 OK
+  # < Content-Type: binary/octet-stream
+  # < Content-Length: 28916
+  # < Connection: keep-alive
+  # < Date: Wed, 21 Jun 2023 16:50:48 GMT
+  # < Last-Modified: Wed, 21 Jun 2023 16:44:22 GMT
+  # < Etag: "b5a7fa846fb118dc4a734818af1c21b4"
+  # < X-Amz-Server-Side-Encryption: AES256
+  # < X-Amz-Version-Id: R885zJQNnCRvcFoa4n.5SBnTm6Z_ghGW
+  # < Accept-Ranges: bytes
+  # < Server: AmazonS3
+  # < Via: 1.1 a25f829e86f504a329e71fa3f4d21484.cloudfront.net (CloudFront)
+  # < Alt-Svc: h3=":443"; ma=86400
+  # < Age: 29
+  #
+  # < Awesome-Header: wow!!  --- custom header
+  #
+  # < Cache-Control: public, max-age=63072000
+  # < X-Cache: Hit from cloudfront
+  # < X-Amz-Cf-Pop: LHR62-C5
+  # < X-Amz-Cf-Id: olPAukeQPR-RRtLvQxyFAnwEwWEhDYl3V-FW3BpKyS-m85kIGNwWZw==
+  
+  #CDNbucketDistributionFunction: # viewer response function
+  #  Type: AWS::CloudFront::Function
+  #  Properties:
+  #    Name: !Sub "${AWS::StackName}-CDNbucketDistributionFunction"
+  #    AutoPublish: TRUE
+  #    FunctionCode: >
+  #      function handler(event) {
+  #          var response = event.response;
+  #          var headers = response.headers;
+  #      
+  #          // Set custom headers
+  #          headers['awesome-header'] = { value: 'wow!!' };
+  #      
+  #          // Return response to viewers
+  #          return response;
+  #      }
+  #    FunctionConfig:
+  #      Comment: !Join ['', [!Ref AWS::StackName, '-CDNbucketDistributionFunction', 'description']]
+  #      Runtime: cloudfront-js-1.0
+  
+  CDNbucketDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Aliases: !If
+          - IsDomainConfigured
+          - - !Sub "${subDomainName}.${domainName}"
+            - !Ref "AWS::NoValue"
+          - []
+        Comment: comment for the distribution
+        DefaultCacheBehavior:
+          TargetOriginId: !Sub "${AWS::StackName}-s3Origin" # 'id' field of the Origins
+          ViewerProtocolPolicy: allow-all
+          #FunctionAssociations:
+          #  - EventType: viewer-response
+          #    FunctionARN: !GetAtt CDNbucketDistributionFunction.FunctionMetadata.FunctionARN
+          AllowedMethods:
+            - HEAD
+            - GET
+            - OPTIONS
+          ForwardedValues:
+            QueryString: 'false'
+            Cookies:
+              Forward: none
+        Enabled: TRUE
+        HttpVersion: http2and3
+        IPV6Enabled: TRUE
+        Origins:
+          - Id: !Sub "${AWS::StackName}-s3Origin"
+            DomainName: !Sub "${CDNbucket}.s3.${AWS::Region}.amazonaws.com"
+            OriginAccessControlId: !Ref CDNbucketDistributionOAC
+            ConnectionAttempts: 3
+            ConnectionTimeout: 10
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        PriceClass: PriceClass_100 # PriceClass_100 - US & EU, PriceClass_200 - US & EU & Asia, PriceClass_400 - All regions
+        Restrictions:
+          GeoRestriction:
+              Locations: 
+                - FR
+              RestrictionType: blacklist
+        Staging: FALSE
+        ViewerCertificate: # The certificate must be in the US East (N. Virginia) Region (us-east-1).
+          CloudFrontDefaultCertificate: !If [IsDomainConfigured, !Ref "AWS::NoValue", true]
+          AcmCertificateArn: !If [IsDomainConfigured, !Ref domainCertUSEast1, !Ref "AWS::NoValue"]
+          MinimumProtocolVersion: !If [IsDomainConfigured, TLSv1.2_2021, !Ref "AWS::NoValue"]
+          SslSupportMethod: !If [IsDomainConfigured, sni-only, !Ref "AWS::NoValue"]
+    DependsOn:
+      - CDNbucketDistributionOAC
+  
+  CDNdistributionRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: IsDomainConfigured
+    Properties:
+      Name: !Sub "${subDomainName}.${domainName}"
+      HostedZoneId: !Ref hostedZoneId
+      Type: CNAME
+      ResourceRecords:
+        - !GetAtt CDNbucketDistribution.DomainName
+      TTL: 300
+  
+  AccessLogsDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref accessLogsDatabase
+        LocationUri: !Ref CDNbucketAccessLogs
+  
+  AccessLogsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref AccessLogsDatabase
+      TableInput:
+        Name: !Ref accessLogsTable
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          EXTERNAL: 'TRUE'
+        PartitionKeys: []
+        StorageDescriptor:
+          Location: !Sub "s3://${CDNbucketAccessLogs}/${accessLogsTable}/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Compressed: False
+          NumberOfBuckets: -1
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.serde2.RegexSerDe
+            Parameters:
+              serialization.format: '1'
+              input.regex: '([^ ]*) ([^ ]*) \[(.*?)\] ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*) ("[^"]*"|-) (-|[0-9]*) ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*) ("[^"]*"|-) ([^ ]*)(?: ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*))?.*$'
+          BucketColumns: []
+          SortColumns: []
+          Parameters: {}
+          SkewedInfo:
+            SkewedColumnNames: []
+            SkewedColumnValueLocationMaps: {}
+            SkewedColumnValues: []
+          StoredAsSubDirectories: False
+          Columns:
+            - Name: bucketowner
+              Type: string
+            - Name: bucket_name
+              Type: string
+            - Name: requestdatetime
+              Type: string
+            - Name: remoteip
+              Type: string
+            - Name: requester
+              Type: string
+            - Name: requestid
+              Type: string
+            - Name: operation
+              Type: string
+            - Name: key
+              Type: string
+            - Name: request_uri
+              Type: string
+            - Name: httpstatus
+              Type: string
+            - Name: errorcode
+              Type: string
+            - Name: bytessent
+              Type: string
+            - Name: objectsize
+              Type: string
+            - Name: totaltime
+              Type: string
+            - Name: turnaroundtime
+              Type: string
+            - Name: referrer
+              Type: string
+            - Name: useragent
+              Type: string
+            - Name: versionid
+              Type: string
+            - Name: hostid
+              Type: string
+            - Name: sigv
+              Type: string
+            - Name: ciphersuite
+              Type: string
+            - Name: authtype
+              Type: string
+            - Name: endpoint
+              Type: string
+            - Name: tlsversion
+              Type: string
+  
+Outputs:
+  CDNBucketName:
+    Value: !Ref CDNbucket
+  CDNLoggingBucketName:
+    Value: !Ref CDNbucketAccessLogs
+  CloudfrontDomainName:
+    Value: !GetAtt CDNbucketDistribution.DomainName

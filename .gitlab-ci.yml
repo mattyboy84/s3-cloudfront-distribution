@@ -1,0 +1,25 @@
+image: amazon/aws-sam-cli-build-image-nodejs14.x:latest
+
+stages:
+  - deploy
+
+variables:
+  STACK_NAME: s3-cloudfront-distribution
+  REGION: eu-west-2
+
+deploy:
+  image: amazon/aws-sam-cli-build-image-nodejs14.x:latest
+  stage: deploy
+  script:
+    - sam build
+    - sam package --output-template-file packaged.yaml --s3-bucket $S3_DEPLOY_BUCKET --region $REGION
+      # with domain
+    - sam deploy --no-fail-on-empty-changeset --template-file packaged.yaml --stack-name $STACK_NAME --s3-bucket $S3_DEPLOY_BUCKET --capabilities CAPABILITY_NAMED_IAM --region $REGION --parameter-overrides domainName=$ROUTE_53_DOMAIN hostedZoneId=$ROUTE_53_DOMAIN_ID domainCertUSEast1=$ROUTE_53_DOMAIN_CERT_US_EAST_1
+
+    - CDN_BUCKET=$(aws cloudformation --region $REGION describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='CDNBucketName'].OutputValue" --output text)
+    - >
+      aws s3api put-object --bucket $CDN_BUCKET --body s3/dog.png --key dog.png --region $REGION
+    - >
+      aws s3api put-object --bucket $CDN_BUCKET --body s3/json.json --key json.json --region $REGION
+    - >
+      aws s3api put-object --bucket $CDN_BUCKET --body s3/4xx-errors/403-forbidden.html --key 4xx-errors/403-forbidden.html --region $REGION
